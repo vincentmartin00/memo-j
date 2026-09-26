@@ -129,7 +129,8 @@ Deno.serve(async (req) => {
   const bilan: unknown[] = [];
   for (const g of reglages ?? []) {
     const now = localNow(g.fuseau || 'Europe/Paris');
-    const dans = (heure: string) => now.minutes >= minutesDe(heure) && now.minutes < minutesDe(heure) + 180;
+    // fenêtre de 3 h après l'heure choisie, y compris quand elle passe minuit
+    const dans = (heure: string) => (now.minutes - minutesDe(heure) + 1440) % 1440 < 180;
     const deja = async (type: string) => {
       const { error } = await admin.from('notifications_envoyees').insert({ user_id: g.user_id, type, jour: now.iso });
       return !!error; // conflit = déjà envoyée aujourd'hui
