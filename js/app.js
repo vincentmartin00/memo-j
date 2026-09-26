@@ -1087,4 +1087,7 @@ sb.auth.onAuthStateChange(async (evt, session) => {
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState === 'visible' && S.user && !S.recovery) { try { await charger(); rendre(); } catch (_) {} }
 });
+// pas de zoom (pincement ni double-tape) : l'app se comporte comme une app native
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+// le double-tape est neutralisé par « touch-action: manipulation » dans styles.css
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
