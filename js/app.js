@@ -4,6 +4,7 @@ import * as A from './algo.js';
 
 const SUPABASE_URL = 'https://ejpsnyrmsxezkrocyglx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_I60hj9XIlqI-4k-FHGEJEA_RKQRrnNG';
+const VAPID_PUBLIC = 'BGMoJylgpwsTCCBSxRa8oVwCL5jgODpiFc2LAn6-q1S03kEMZAQwQbGUUsm2N9yEfHyTdMY_HJwncxiZ2DO3bSI';
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
 
 // ---------------------------------------------------------------- état
@@ -608,7 +609,7 @@ function vueReglages() {
       <h1 style="font-size:32px">Réglages</h1>
       <div class="label">Notifications</div>
       <div class="card">${sw('notif_jour', 'Programme du jour', 'Tous les matins', timeIn('heure_notif_jour'))}${sw('notif_semaine', 'Bilan de la semaine', 'Le lundi, après celle du jour', timeIn('heure_notif_semaine'))}${sw('pastille', 'Pastille sur l’icône', 'Révisions restantes du jour')}</div>
-      <div class="small muted">Les notifications seront activées à l'étape suivante, une fois l'app installée sur ton iPhone.</div>
+      <div class="card">${etatPush()}</div>
       <div class="label">Durée des créneaux</div>
       <div class="card">
         <div class="list-row" style="padding:6px 12px 6px 16px"><span class="grow"><b style="font-family:var(--title)">J0</b></span>${dureeSel('duree_j0', [30, 45, 60, 90, 120])}</div>
@@ -626,6 +627,47 @@ function vueReglages() {
       <div class="label">Compte</div>
       <div class="card"><div class="list-row"><span class="grow small muted">Connecté : ${esc(S.user.email)}</span></div><button class="list-row" data-action="deconnexion" style="color:var(--late);font-weight:600">Se déconnecter</button></div>
     </div></main>`;
+}
+
+// ---------------------------------------------------------------- Notifications push
+const installee = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const pushPossible = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+function etatPush() {
+  if (!pushPossible() || !installee()) {
+    return '<div class="list-row"><span class="grow small muted">Pour recevoir les notifications, ouvre Mémo J depuis son icône sur l\u2019écran d\u2019accueil (iPhone avec iOS 16.4 ou plus récent).</span></div>';
+  }
+  const perm = Notification.permission;
+  if (perm === 'denied') return '<div class="list-row"><span class="grow small" style="color:var(--late)">Notifications refusées. Pour les autoriser : Réglages de l\u2019iPhone › Notifications › Mémo J.</span></div>';
+  const actif = perm === 'granted' && localStorage.getItem('memoj-push') === '1';
+  return `<div class="list-row" style="padding:10px 12px 10px 16px"><span class="grow stack" style="gap:2px"><b style="font-size:15px">${actif ? 'Notifications activées sur cet appareil' : 'Activer les notifications'}</b><span class="small muted">${actif ? 'Tu les recevras aux heures ci-dessus.' : 'L\u2019iPhone va te demander l\u2019autorisation.'}</span></span>
+    ${actif ? '<button class="chip" data-action="push-test">Tester</button>' : '<button class="chip" data-action="push-activer" style="background:var(--accent);color:var(--fab-fg);border-color:var(--accent)">Activer</button>'}</div>`;
+}
+function cleVapid(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+async function enregistrerAbonnement() {
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: cleVapid(VAPID_PUBLIC) });
+  const j = sub.toJSON();
+  const { error } = await sb.from('abonnements_push').upsert({ endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth }, { onConflict: 'endpoint' });
+  if (error) throw error;
+  localStorage.setItem('memoj-push', '1');
+}
+async function activerPush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { rendre(); return toast('Notifications non autorisées', 'Tu pourras les activer plus tard dans les Réglages de l\u2019iPhone.'); }
+  await enregistrerAbonnement();
+  rendre();
+  toast('Notifications activées', 'Touche « Tester » pour en recevoir une tout de suite.');
+}
+async function testerPush() {
+  const { data, error } = await sb.functions.invoke('notifier', { body: { mode: 'test' } });
+  if (error) throw error;
+  toast(data?.envoyees ? 'Notification envoyée' : 'Aucun appareil trouvé', data?.envoyees ? 'Elle doit arriver dans quelques secondes.' : 'Réactive les notifications sur cet appareil.');
+  if (!data?.envoyees) { localStorage.removeItem('memoj-push'); rendre(); }
 }
 
 // ---------------------------------------------------------------- Connexion
@@ -977,6 +1019,8 @@ app.addEventListener('click', async (e) => {
       case 'toggle-archives': S.ui.archOpen = !S.ui.archOpen; return rendre();
       case 'sem-prev': S.ui.semaineOffset = Math.max(0, S.ui.semaineOffset - 1); return rendre();
       case 'sem-next': S.ui.semaineOffset++; return rendre();
+      case 'push-activer': return activerPush();
+      case 'push-test': return testerPush();
       case 'export-json': return exporterJSON();
       case 'export-csv': return exporterCSV();
       case 'deconnexion': await sb.auth.signOut(); return;
@@ -1034,6 +1078,7 @@ sb.auth.onAuthStateChange(async (evt, session) => {
   setTimeout(async () => {
     app.innerHTML = `<main class="page no-tabs"><div class="empty">${I.logo}<p>Chargement…</p></div></main>`;
     try { await charger(); } catch (err) { erreur(err); }
+    if (pushPossible() && installee() && Notification.permission === 'granted') enregistrerAbonnement().catch(() => {});
     if (!location.hash || location.hash.includes('access_token')) history.replaceState(null, '', location.pathname + '#/aujourdhui');
     rendre();
   }, 0);
