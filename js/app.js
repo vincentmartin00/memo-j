@@ -876,28 +876,41 @@ function ficheChapitre({ chId = null, matiereId = null } = {}) {
 function ficheRevision({ revId = null, chId = null }) {
   const rv = revId ? S.revisions.find((r) => r.id === revId) : null;
   const ch = S.chapitres.find((c) => c.id === (rv?.chapitre_id || chId)); if (!ch) return;
+  const estJ0 = rv?.note === 'decouverte';
   let note = rv?.note || 'frais';
   const localISO = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   const val = rv ? localISO(new Date(rv.faite_le)) : `${A.ajouterJours(today(), -1)}T18:00`;
-  const notes = rv?.note === 'decouverte' ? ['decouverte'] : ['rate', 'complique', 'frais', 'tres_frais'];
-  const html = `${enteteFiche(rv ? 'Modifier la révision' : 'Révision passée', esc(ch.nom))}
+  const notes = ['rate', 'complique', 'frais', 'tres_frais'];
+  const html = `${enteteFiche(estJ0 ? 'Modifier le J0' : rv ? 'Modifier la révision' : 'Révision passée', esc(ch.nom))}
     <div class="field"><label for="quand">Date et heure</label><input id="quand" class="input" type="datetime-local" value="${val}" max="${localISO(new Date())}"></div>
-    ${rv?.note === 'decouverte' ? '<div class="small muted">C’est le J0 du chapitre : pour changer sa date, modifie la date du J0 du chapitre.</div>' : `<div class="field"><div class="flabel">Comment ça s'était passé ?</div><div class="stack" style="gap:8px" id="opts">${notes.map((k) => `<button class="option ${k === note ? 'on' : ''}" data-note="${k}"><span class="dot" style="width:12px;height:12px;border-radius:6px;background:${NOTE_COULEUR[k]}"></span><b>${A.NOTES[k].label}</b></button>`).join('')}</div></div>`}
-    ${rv?.note === 'decouverte' ? '' : `<button class="btn" id="ok">${rv ? 'Enregistrer' : 'Ajouter la révision'}</button>`}
-    ${rv && rv.note !== 'decouverte' ? '<button class="btn ghost" id="suppr" style="color:var(--late)">Supprimer cette révision</button>' : ''}
+    ${estJ0 ? '<div class="small muted">C\u2019est la découverte du chapitre. Changer sa date déplace aussi le J0 du chapitre et recalcule toutes les révisions suivantes.</div>'
+      : `<div class="field"><div class="flabel">Comment ça s'était passé ?</div><div class="stack" style="gap:8px" id="opts">${notes.map((k) => `<button class="option ${k === note ? 'on' : ''}" data-note="${k}"><span class="dot" style="width:12px;height:12px;border-radius:6px;background:${NOTE_COULEUR[k]}"></span><b>${A.NOTES[k].label}</b></button>`).join('')}</div></div>`}
+    <button class="btn" id="ok">${rv ? 'Enregistrer' : 'Ajouter la révision'}</button>
+    ${rv && !estJ0 ? '<button class="btn ghost" id="suppr" style="color:var(--late)">Supprimer cette révision</button>' : ''}
     <div class="small muted">La suite du planning est recalculée automatiquement.</div>`;
   ouvrirFiche(html, (w, fermer) => {
-    if (rv?.note === 'decouverte') w.querySelector('#quand').disabled = true;
     w.querySelector('#opts')?.addEventListener('click', (e) => { const b = e.target.closest('[data-note]'); if (!b) return; note = b.dataset.note; w.querySelectorAll('.option').forEach((o) => o.classList.toggle('on', o === b)); });
-    w.querySelector('#ok')?.addEventListener('click', async (e) => {
+    w.querySelector('#ok').addEventListener('click', async (e) => {
       const d = new Date(w.querySelector('#quand').value);
       if (isNaN(d)) return;
-      if (A.ecartJours(ch.date_j0, A.isoJour(d)) < 0) { toast('Date impossible', 'Une révision ne peut pas précéder le J0.'); return; }
+      const jour = A.isoJour(d);
+      const autres = revsDe(ch.id).filter((r) => r.id !== rv?.id);
+      if (estJ0) {
+        if (autres.some((r) => new Date(r.faite_le) < d)) { toast('Date impossible', 'Le J0 doit rester avant toutes les autres révisions du chapitre.'); return; }
+      } else if (A.ecartJours(ch.date_j0, jour) < 0) { toast('Date impossible', 'Une révision ne peut pas précéder le J0.'); return; }
       e.currentTarget.disabled = true;
-      const payload = { faite_le: d.toISOString(), note, j_label: A.ecartJours(ch.date_j0, A.isoJour(d)) };
       try {
-        if (rv) { const up = await sb.from('revisions').update(payload).eq('id', rv.id).select().single(); if (up.error) throw up.error; Object.assign(rv, up.data); }
-        else { const ins = await sb.from('revisions').insert({ ...payload, chapitre_id: ch.id }).select().single(); if (ins.error) throw ins.error; S.revisions.push(ins.data); }
+        if (estJ0) {
+          const up = await sb.from('revisions').update({ faite_le: d.toISOString() }).eq('id', rv.id).select().single(); if (up.error) throw up.error; Object.assign(rv, up.data);
+          if (jour !== ch.date_j0) {
+            const uc = await sb.from('chapitres').update({ date_j0: jour }).eq('id', ch.id).select().single(); if (uc.error) throw uc.error; Object.assign(ch, uc.data);
+          }
+        } else {
+          const memeJour = rv && A.isoJour(rv.faite_le) === jour;
+          const payload = { faite_le: d.toISOString(), note, j_label: memeJour ? rv.j_label : A.ecartJours(ch.date_j0, jour) };
+          if (rv) { const up = await sb.from('revisions').update(payload).eq('id', rv.id).select().single(); if (up.error) throw up.error; Object.assign(rv, up.data); }
+          else { const ins = await sb.from('revisions').insert({ ...payload, chapitre_id: ch.id }).select().single(); if (ins.error) throw ins.error; S.revisions.push(ins.data); }
+        }
         await recalculer(ch); fermer(); rendre(); toast('Historique mis à jour', ch.prochaine_date ? `Prochaine : ${dCourt(ch.prochaine_date)}` : '');
       } catch (err) { erreur(err); e.currentTarget.disabled = false; }
     });
