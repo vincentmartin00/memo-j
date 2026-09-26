@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="1024" height="1024">
+  <title>Mémo J</title>
+  <rect width="180" height="180" fill="#2F5BE0"/>
+  <path d="M92 44V114a25 25 0 0 1-50 0" fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="118" cy="126" r="6" fill="#F0945F"/>
+  <circle cx="130" cy="98" r="8.5" fill="#F0945F"/>
+  <circle cx="140" cy="64" r="11.5" fill="#F0945F"/>
+</svg>
