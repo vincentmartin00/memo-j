@@ -5,7 +5,23 @@ import * as A from './algo.js';
 const SUPABASE_URL = 'https://ejpsnyrmsxezkrocyglx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_I60hj9XIlqI-4k-FHGEJEA_RKQRrnNG';
 const VAPID_PUBLIC = 'BGMoJylgpwsTCCBSxRa8oVwCL5jgODpiFc2LAn6-q1S03kEMZAQwQbGUUsm2N9yEfHyTdMY_HJwncxiZ2DO3bSI';
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+// Réseau : sur iPhone, la première requête après un retour d'arrière-plan échoue souvent
+// (« Load failed ») sans jamais atteindre le serveur. On la relance automatiquement.
+let versionLocale = 0; // augmente à chaque écriture : une actualisation plus ancienne ne doit pas l'écraser
+async function fetchAvecReprise(input, init = {}) {
+  const methode = (init.method || 'GET').toUpperCase();
+  if (methode !== 'GET' && methode !== 'HEAD') versionLocale++;
+  let derniere;
+  for (const attente of [0, 600, 1800]) {
+    if (attente) await new Promise((r) => setTimeout(r, attente));
+    try { return await fetch(input, init); } catch (e) { derniere = e; if (init.signal?.aborted) throw e; }
+  }
+  throw derniere;
+}
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+  global: { fetch: fetchAvecReprise },
+});
 
 // ---------------------------------------------------------------- état
 const S = {
@@ -79,7 +95,14 @@ const chapitresDe = (mId) => S.chapitres.filter((c) => c.matiere_id === mId).sor
 const retentionCh = (ch, iso = today()) => A.retention(revsDe(ch.id), iso);
 const jDe = (ch) => ch.prochain_j ?? A.ecartJours(ch.date_j0, ch.prochaine_date || today());
 
-async function charger() {
+// Un seul chargement à la fois ; si une écriture a eu lieu pendant le chargement, on recharge.
+let chargementEnCours = null;
+function charger() {
+  if (!chargementEnCours) chargementEnCours = chargerVraiment().finally(() => { chargementEnCours = null; });
+  return chargementEnCours;
+}
+async function chargerVraiment(essai = 0) {
+  const v0 = versionLocale;
   const [m, c, r, g] = await Promise.all([
     sb.from('matieres').select('*'),
     sb.from('chapitres').select('*'),
@@ -87,6 +110,7 @@ async function charger() {
     sb.from('reglages').select('*').maybeSingle(),
   ]);
   for (const x of [m, c, r, g]) if (x.error) throw x.error;
+  if (versionLocale !== v0 && essai < 3) return chargerVraiment(essai + 1);
   S.matieres = m.data; S.chapitres = c.data; S.revisions = r.data;
   if (!g.data) {
     const ins = await sb.from('reglages').insert({}).select().single();
@@ -151,7 +175,9 @@ function toast(titre, texte) {
 }
 function erreur(e) {
   console.error(e);
-  toast('Oups, ça n’a pas marché', e?.message || String(e));
+  const msg = e?.message || String(e);
+  if (/load failed|failed to fetch|networkerror|network request/i.test(msg)) return toast('Pas de connexion', 'Rien n’a été perdu : vérifie ton réseau et touche à nouveau le bouton.');
+  toast('Oups, ça n’a pas marché', msg);
 }
 
 // ---------------------------------------------------------------- fiches (bas → haut)
@@ -210,7 +236,9 @@ function rendre() {
   const scrollKey = location.hash;
   const prev = app.querySelector('.page');
   const garderScroll = prev && prev.dataset.key === scrollKey ? prev.scrollTop : 0;
-  app.innerHTML = vue(r);
+  let html;
+  try { html = vue(r); } catch (err) { console.error('affichage', err); html = vueAujourdhui(); }
+  app.innerHTML = html;
   const page = app.querySelector('.page');
   if (page) { page.dataset.key = scrollKey; page.scrollTop = garderScroll; }
   majPastille();
@@ -696,6 +724,7 @@ function ficheValidation(chId) {
   const revs = revsDe(ch.id);
   const j = jDe(ch);
   let note = 'frais';
+  const idRev = crypto.randomUUID();
   const maintenant = new Date();
   const localISO = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   const calc = (dt) => A.apercus({ dateJ0: ch.date_j0, faiteLe: A.isoJour(dt), rang: revs.length, intervalle: Number(ch.intervalle_jours), facteur: Number(ch.facteur), examen: m.semaine_examen, continuer: ch.continuer_apres_examen });
@@ -724,22 +753,23 @@ function ficheValidation(chId) {
     w.querySelector('#opts').addEventListener('click', (e) => { const b = e.target.closest('[data-note]'); if (!b) return; note = b.dataset.note; w.querySelectorAll('.option').forEach((o) => o.classList.toggle('on', o === b)); maj(); });
     w.querySelector('#fait-le').addEventListener('change', () => { if (note !== 'decouverte') maj(); });
     w.querySelector('#ok').addEventListener('click', async (e) => {
-      e.currentTarget.disabled = true;
+      const bouton = e.currentTarget; bouton.disabled = true;
       try {
         const dt = new Date(w.querySelector('#fait-le').value || Date.now());
-        const ins = await sb.from('revisions').insert({ chapitre_id: ch.id, j_label: j, date_prevue: ch.prochaine_date, faite_le: dt.toISOString(), note }).select().single();
+        const ins = await sb.from('revisions').upsert({ id: idRev, chapitre_id: ch.id, j_label: j, date_prevue: ch.prochaine_date, faite_le: dt.toISOString(), note }, { onConflict: 'id' }).select().single();
         if (ins.error) throw ins.error;
-        S.revisions.push(ins.data);
+        S.revisions = S.revisions.filter((x) => x.id !== ins.data.id); S.revisions.push(ins.data);
         await recalculer(ch);
         fermer(); rendre();
         toast('Révision validée', ch.prochaine_date ? `Prochaine : ${dCourt(ch.prochaine_date)} (J${ch.prochain_j}).` : 'Cycle terminé pour ce chapitre.');
-      } catch (err) { erreur(err); e.currentTarget.disabled = false; }
+      } catch (err) { erreur(err); bouton.disabled = false; }
     });
   });
 }
 
 function ficheMatiere(mId) {
   const m = mId ? S.matieres.find((x) => x.id === mId) : null;
+  const idNouveau = crypto.randomUUID();
   let couleurChoisie = m?.couleur || PALETTE[actives().length % PALETTE.length][1];
   let semaine = m?.semaine_examen ?? null;
   const lundis = []; let l = A.lundi(today());
@@ -774,7 +804,7 @@ function ficheMatiere(mId) {
     w.querySelector('#ok').addEventListener('click', async (e) => {
       const nom = w.querySelector('#nom-m').value.trim();
       if (!nom) { w.querySelector('#nom-m').classList.add('bad'); w.querySelector('#nom-m').focus(); return; }
-      e.currentTarget.disabled = true;
+      const bouton = e.currentTarget; bouton.disabled = true;
       const val = { nom, couleur: couleurChoisie, semaine_examen: w.querySelector('#semaine').value || null };
       try {
         if (m) {
@@ -782,13 +812,13 @@ function ficheMatiere(mId) {
           Object.assign(m, data);
           for (const c of chapitresDe(m.id)) await recalculer(c); // la date d'examen change le plan
         } else {
-          const { data, error } = await sb.from('matieres').insert({ ...val, ordre: S.matieres.length }).select().single(); if (error) throw error;
-          S.matieres.push(data); S.ui.open[data.id] = true;
+          const { data, error } = await sb.from('matieres').upsert({ ...val, id: idNouveau, ordre: S.matieres.length }, { onConflict: 'id' }).select().single(); if (error) throw error;
+          S.matieres = S.matieres.filter((x) => x.id !== data.id); S.matieres.push(data); S.ui.open[data.id] = true;
         }
         fermer();
         if (!m && location.hash !== '#/matieres') location.hash = '#/matieres'; else rendre();
         toast(m ? 'Matière enregistrée' : 'Matière créée', m ? '' : 'Ajoute maintenant ses chapitres.');
-      } catch (err) { erreur(err); e.currentTarget.disabled = false; }
+      } catch (err) { erreur(err); bouton.disabled = false; }
     });
     w.querySelector('#suppr')?.addEventListener('click', async () => {
       if (!confirm(`Supprimer « ${m.nom} » et tous ses chapitres ? C'est définitif.`)) return;
@@ -807,6 +837,7 @@ function ficheChapitre({ chId = null, matiereId = null } = {}) {
   const ch = chId ? S.chapitres.find((c) => c.id === chId) : null;
   const act = actives();
   if (!act.length) return ficheMatiere();
+  const idChapitre = crypto.randomUUID(), idJ0 = crypto.randomUUID();
   let mSel = ch?.matiere_id || matiereId || act[0].id;
   let cont = ch ? ch.continuer_apres_examen : false;
   const html = `${enteteFiche(ch ? 'Modifier le chapitre' : 'Nouveau chapitre')}
@@ -833,7 +864,7 @@ function ficheChapitre({ chId = null, matiereId = null } = {}) {
       const nom = w.querySelector('#nom-c').value.trim();
       if (!nom) { w.querySelector('#nom-c').classList.add('bad'); w.querySelector('#nom-c').focus(); return; }
       const j0 = w.querySelector('#j0').value || today();
-      e.currentTarget.disabled = true;
+      const bouton = e.currentTarget; bouton.disabled = true;
       try {
         if (ch) {
           const { data, error } = await sb.from('chapitres').update({ nom, matiere_id: mSel, date_j0: j0, continuer_apres_examen: cont }).eq('id', ch.id).select().single(); if (error) throw error;
@@ -848,19 +879,19 @@ function ficheChapitre({ chId = null, matiereId = null } = {}) {
           await recalculer(ch);
           fermer(); rendre(); toast('Chapitre enregistré', '');
         } else {
-          const ins = await sb.from('chapitres').insert({ nom, matiere_id: mSel, date_j0: j0, continuer_apres_examen: cont, prochaine_date: j0, prochain_j: 0 }).select().single();
+          const ins = await sb.from('chapitres').upsert({ id: idChapitre, nom, matiere_id: mSel, date_j0: j0, continuer_apres_examen: cont, prochaine_date: j0, prochain_j: 0 }, { onConflict: 'id' }).select().single();
           if (ins.error) throw ins.error;
-          const nouveau = ins.data; S.chapitres.push(nouveau);
+          const nouveau = ins.data; S.chapitres = S.chapitres.filter((x) => x.id !== nouveau.id); S.chapitres.push(nouveau);
           // le J0 est fait au moment de l'ajout (compréhension + relecture du cours)
           const faite = j0 === today() ? new Date().toISOString() : new Date(`${j0}T12:00:00`).toISOString();
-          const rv = await sb.from('revisions').insert({ chapitre_id: nouveau.id, j_label: 0, date_prevue: j0, faite_le: faite, note: 'decouverte' }).select().single();
+          const rv = await sb.from('revisions').upsert({ id: idJ0, chapitre_id: nouveau.id, j_label: 0, date_prevue: j0, faite_le: faite, note: 'decouverte' }, { onConflict: 'id' }).select().single();
           if (rv.error) throw rv.error;
-          S.revisions.push(rv.data);
+          S.revisions = S.revisions.filter((x) => x.id !== rv.data.id); S.revisions.push(rv.data);
           await recalculer(nouveau);
           fermer(); rendre();
           toast('Chapitre ajouté', `J1 prévu ${dCourt(nouveau.prochaine_date)}`);
         }
-      } catch (err) { erreur(err); e.currentTarget.disabled = false; }
+      } catch (err) { erreur(err); bouton.disabled = false; }
     });
     w.querySelector('#suppr')?.addEventListener('click', async () => {
       if (!confirm(`Supprimer « ${ch.nom} » et son historique ? C'est définitif.`)) return;
@@ -877,6 +908,7 @@ function ficheRevision({ revId = null, chId = null }) {
   const rv = revId ? S.revisions.find((r) => r.id === revId) : null;
   const ch = S.chapitres.find((c) => c.id === (rv?.chapitre_id || chId)); if (!ch) return;
   const estJ0 = rv?.note === 'decouverte';
+  const idRev = crypto.randomUUID();
   let note = rv?.note || 'frais';
   const localISO = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   const val = rv ? localISO(new Date(rv.faite_le)) : `${A.ajouterJours(today(), -1)}T18:00`;
@@ -898,7 +930,7 @@ function ficheRevision({ revId = null, chId = null }) {
       if (estJ0) {
         if (autres.some((r) => new Date(r.faite_le) < d)) { toast('Date impossible', 'Le J0 doit rester avant toutes les autres révisions du chapitre.'); return; }
       } else if (A.ecartJours(ch.date_j0, jour) < 0) { toast('Date impossible', 'Une révision ne peut pas précéder le J0.'); return; }
-      e.currentTarget.disabled = true;
+      const bouton = e.currentTarget; bouton.disabled = true;
       try {
         if (estJ0) {
           const up = await sb.from('revisions').update({ faite_le: d.toISOString() }).eq('id', rv.id).select().single(); if (up.error) throw up.error; Object.assign(rv, up.data);
@@ -909,10 +941,10 @@ function ficheRevision({ revId = null, chId = null }) {
           const memeJour = rv && A.isoJour(rv.faite_le) === jour;
           const payload = { faite_le: d.toISOString(), note, j_label: memeJour ? rv.j_label : A.ecartJours(ch.date_j0, jour) };
           if (rv) { const up = await sb.from('revisions').update(payload).eq('id', rv.id).select().single(); if (up.error) throw up.error; Object.assign(rv, up.data); }
-          else { const ins = await sb.from('revisions').insert({ ...payload, chapitre_id: ch.id }).select().single(); if (ins.error) throw ins.error; S.revisions.push(ins.data); }
+          else { const ins = await sb.from('revisions').upsert({ ...payload, id: idRev, chapitre_id: ch.id }, { onConflict: 'id' }).select().single(); if (ins.error) throw ins.error; S.revisions = S.revisions.filter((x) => x.id !== idRev); S.revisions.push(ins.data); }
         }
         await recalculer(ch); fermer(); rendre(); toast('Historique mis à jour', ch.prochaine_date ? `Prochaine : ${dCourt(ch.prochaine_date)}` : '');
-      } catch (err) { erreur(err); e.currentTarget.disabled = false; }
+      } catch (err) { erreur(err); bouton.disabled = false; }
     });
     w.querySelector('#suppr')?.addEventListener('click', async () => {
       const { error } = await sb.from('revisions').delete().eq('id', rv.id); if (error) return erreur(error);
@@ -1085,12 +1117,15 @@ async function majReglage(val) {
 sb.auth.onAuthStateChange(async (evt, session) => {
   if (evt === 'PASSWORD_RECOVERY') { S.user = session?.user || null; S.recovery = true; return rendre(); }
   const u = session?.user || null;
-  if (evt !== 'INITIAL_SESSION' && evt !== 'SIGNED_IN' && u?.id === S.user?.id) return;
+  // même compte déjà chargé ou en cours (SIGNED_IN après INITIAL_SESSION, TOKEN_REFRESHED…) : rien à refaire
+  if (u && S.user && u.id === S.user.id && (S.pret || S.demarrage)) { S.user = u; return; }
   S.user = u;
-  if (!u) { S.matieres = []; S.chapitres = []; S.revisions = []; S.reglages = null; appliquerTheme(); return rendreConnexion(); }
+  if (!u) { S.pret = false; S.demarrage = false; S.matieres = []; S.chapitres = []; S.revisions = []; S.reglages = null; appliquerTheme(); return rendreConnexion(); }
+  S.demarrage = true;
   setTimeout(async () => {
     app.innerHTML = `<main class="page no-tabs"><div class="empty">${I.logo}<p>Chargement…</p></div></main>`;
-    try { await charger(); } catch (err) { erreur(err); }
+    try { await charger(); S.pret = true; } catch (err) { erreur(err); }
+    S.demarrage = false;
     if (pushPossible() && installee() && Notification.permission === 'granted') enregistrerAbonnement().catch(() => {});
     if (!location.hash || location.hash.includes('access_token')) history.replaceState(null, '', location.pathname + '#/aujourdhui');
     rendre();
@@ -1098,7 +1133,8 @@ sb.auth.onAuthStateChange(async (evt, session) => {
 });
 // rafraîchir quand on revient sur l'app (changement de jour, autre appareil)
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && S.user && !S.recovery) { try { await charger(); rendre(); } catch (_) {} }
+  // pas d'actualisation pendant qu'une fiche est ouverte : elle travaille sur les données affichées
+  if (document.visibilityState === 'visible' && S.pret && !S.recovery && !document.querySelector('.sheet-wrap')) { try { await charger(); rendre(); } catch (_) {} }
 });
 // pas de zoom (pincement ni double-tape) : l'app se comporte comme une app native
 for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });

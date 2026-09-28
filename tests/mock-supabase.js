@@ -13,6 +13,7 @@ class Q {
   constructor(t) { this.t = t; this.f = []; this.op = 'select'; this.payload = null; this.one = false; this.maybe = false; }
   select() { if (this.op === 'select') this.op = 'select'; return this; }
   insert(p) { this.op = 'insert'; this.payload = p; return this; }
+  upsert(p) { this.op = 'upsert'; this.payload = p; return this; }
   update(p) { this.op = 'update'; this.payload = p; return this; }
   delete() { this.op = 'delete'; return this; }
   eq(k, v) { this.f.push((r) => r[k] === v); return this; }
@@ -27,6 +28,9 @@ class Q {
       const arr = Array.isArray(this.payload) ? this.payload : [this.payload];
       rows = arr.map((p) => ({ ...defaults[this.t](), ...p }));
       T.push(...rows);
+    } else if (this.op === 'upsert') {
+      const arr = Array.isArray(this.payload) ? this.payload : [this.payload];
+      rows = arr.map((p) => { const ex = T.find((r) => p.id && r.id === p.id); if (ex) return Object.assign(ex, p); const r = { ...defaults[this.t](), ...p }; T.push(r); return r; });
     } else if (this.op === 'update') {
       rows = T.filter((r) => this.f.every((f) => f(r)));
       rows.forEach((r) => Object.assign(r, this.payload));

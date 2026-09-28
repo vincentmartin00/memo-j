@@ -1,5 +1,5 @@
 // Mémo J — service worker : l'app s'ouvre même sans réseau, et recevra les notifications.
-const CACHE = 'memo-j-v4';
+const CACHE = 'memo-j-v5';
 const FICHIERS = [
   './', './index.html', './styles.css', './manifest.webmanifest',
   './js/app.js', './js/algo.js', './vendor/supabase.js',
